@@ -1,7 +1,7 @@
 
 "use client";
 
-import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import type { AppUser, Channel, Message, Transaction } from './types';
 import { CHANNELS, MESSAGES, TRANSACTIONS, MOCK_USERS } from './mock-data';
 import { useToast } from "@/hooks/use-toast";
@@ -27,6 +27,7 @@ export interface AppContextType {
   isMessageUnlocked: (messageId: string) => boolean;
   typingUsers: { [channelId: string]: string[] };
   connectToChannel: (channelId: string) => void;
+  loadUserChat: (peerId: string) => Promise<void>;
 }
 
 export const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -50,8 +51,8 @@ export const useWallet = () => {
 };
 
 export const useChat = () => {
-  const { channels, messages, sendMessage, isMessageUnlocked, typingUsers, connectToChannel } = useAppContext();
-  return { channels, messages, sendMessage, isMessageUnlocked, typingUsers, connectToChannel };
+  const { channels, messages, sendMessage, isMessageUnlocked, typingUsers, connectToChannel, loadUserChat } = useAppContext();
+  return { channels, messages, sendMessage, isMessageUnlocked, typingUsers, connectToChannel, loadUserChat };
 };
 
 export const useAppProvider = () => {
@@ -69,6 +70,7 @@ export const useAppProvider = () => {
   const [unlockedMessages, setUnlockedMessages] = useState<Set<string>>(new Set());
   const [typingUsers, setTypingUsers] = useState<{ [channelId: string]: string[] }>({});
   const [connectedChannelId, setConnectedChannelId] = useState<string | null>(null);
+  const chatWSRef = useRef<WebSocket | null>(null);
 
 
   function toAppUser(apiUser: { id: string; email?: string; username?: string; role?: string; balance?: number; status?: string }): AppUser {
@@ -97,7 +99,32 @@ export const useAppProvider = () => {
 
   // --- Auth Effects ---
   useEffect(() => {
-    setLoading(false);
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      try {
+        const { apiClient } = await import("./api/useApi");
+        const baseUrl = (await import("./api/useApi")).API_BASE_URL || "";
+        const endpoint = `${baseUrl}/user/checkkauth`;
+        const res = await apiClient<any>(endpoint, { method: "POST" });
+        const apiUser = (res as any)?.data;
+        if (!cancelled && apiUser) {
+          setUser(toAppUser(apiUser));
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setUser(null);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // --- Auth Methods ---
@@ -133,10 +160,76 @@ export const useAppProvider = () => {
   }, [toast, walletBalance]);
 
   const logout = useCallback(async () => {
-    setUser(null);
-    setWalletBalance(0);
-    toast({ title: "Logged out." });
-  }, [toast]);
+    try {
+      const { apiClient } = await import("./api/useApi");
+      const baseUrl = (await import("./api/useApi")).API_BASE_URL || "";
+      const endpoint = `${baseUrl}/user/logout`;
+      const payload: any = {};
+      if (user?.uid) {
+        payload.id = user.uid;
+      }
+      if (user?.username) {
+        payload.username = user.username;
+      } else if (user?.email) {
+        payload.email = user.email;
+      }
+      await apiClient<any>(endpoint, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+    } finally {
+      setUser(null);
+      setWalletBalance(0);
+      toast({ title: "Logged out." });
+    }
+  }, [toast, user]);
+
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let mounted = true;
+    const connect = async () => {
+      if (!user) return;
+      try {
+        const baseUrl = (await import("./api/useApi")).API_BASE_URL || "http://10.50.180.81:42007";
+        const wsUrl = (baseUrl.startsWith("http") ? baseUrl.replace(/^http/, "ws") : baseUrl) + "/ws/chat";
+        ws = new WebSocket(wsUrl);
+        chatWSRef.current = ws;
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg && msg.type === "chat" && msg.data) {
+              const d = msg.data;
+              const incoming: Message = {
+                id: d.id || `msg_${Date.now()}`,
+                channelId: d.receiverId === user.uid ? d.senderId : d.receiverId,
+                author: { uid: d.senderId, name: d.senderId === user.uid ? (user.username || user.email || "You") : "" },
+                content: d.content || "",
+                timestamp: d.timestamp || Date.now(),
+                isLocked: !!d.isLocked,
+                price: d.price || 0,
+                imageData: d.imageData || null,
+                unlockedBy: [],
+              };
+              setMessages(prev => [...prev, incoming]);
+            }
+          } catch {}
+        };
+        ws.onclose = () => {
+          if (chatWSRef.current === ws) {
+            chatWSRef.current = null;
+          }
+        };
+      } catch {}
+    };
+    connect();
+    return () => {
+      mounted = false;
+      if (ws) {
+        try { ws.close(); } catch {}
+      }
+      chatWSRef.current = null;
+    };
+  }, [user]);
 
 
   // --- Wallet Methods ---
@@ -188,22 +281,69 @@ export const useAppProvider = () => {
     return unlockedMessages.has(messageId);
   }, [unlockedMessages]);
 
+  const loadUserChat = useCallback(async (peerId: string) => {
+    if (!user) return;
+    try {
+      const { apiClient } = await import("./api/useApi");
+      const baseUrl = (await import("./api/useApi")).API_BASE_URL || "";
+      const endpoint = `${baseUrl}/user/chats?peerId=${encodeURIComponent(peerId)}`;
+      const res = await apiClient<any>(endpoint, { method: "GET" });
+      const items = (res as any)?.data || [];
+      const mapped: Message[] = items.map((m: any) => ({
+        id: m.id,
+        channelId: m.senderId === user.uid ? m.receiverId : m.senderId,
+        author: {
+          uid: m.senderId,
+          name: m.senderId === user.uid ? (user.username || user.email || "You") : "",
+        },
+        content: m.content || "",
+        timestamp: m.timestamp ? new Date(m.timestamp).getTime() : Date.now(),
+        isLocked: false,
+        price: 0,
+        imageData: m.imageData || null,
+        unlockedBy: [],
+      }));
+      setMessages(prev => {
+        const others = prev.filter(msg => mapped.every(mm => mm.id !== msg.id));
+        return [...others, ...mapped];
+      });
+    } catch {}
+  }, [user]);
+
   const sendMessage = useCallback((channelId: string, content: string, isLocked: boolean, price: number, imageData: string | null = null) => {
     if (!user) return;
     const payloadContent = content.trim().length ? content.trim() : (imageData ? ' ' : '');
-    const optimistic: Message = {
-      id: `msg_${Date.now()}`,
-      channelId,
-      author: { uid: user.uid, name: user.username || user.email || 'You' },
-      content: payloadContent,
-      timestamp: Date.now(),
-      isLocked,
-      price: isLocked ? price : 0,
-      imageData: imageData || null,
-      unlockedBy: [],
-    };
-    setMessages(prev => [...prev, optimistic]);
-  }, [user]);
+    const isKnownChannel = channels.some(c => c.id === channelId);
+
+    if (isKnownChannel) {
+      const optimistic: Message = {
+        id: `msg_${Date.now()}`,
+        channelId,
+        author: { uid: user.uid, name: user.username || user.email || 'You' },
+        content: payloadContent,
+        timestamp: Date.now(),
+        isLocked,
+        price: isLocked ? price : 0,
+        imageData: imageData || null,
+        unlockedBy: [],
+      };
+      setMessages(prev => [...prev, optimistic]);
+      return;
+    }
+
+    if (chatWSRef.current && chatWSRef.current.readyState === WebSocket.OPEN) {
+      try {
+        chatWSRef.current.send(JSON.stringify({
+          type: "send",
+          to: channelId,
+          content: payloadContent,
+          imageData,
+          isLocked,
+          price,
+        }));
+      } catch {}
+    }
+  }, [user, channels]);
 
   // --- Real-time Simulation ---
 
@@ -232,5 +372,6 @@ const connectToChannel = useCallback((channelId: string) => {
     isMessageUnlocked,
     typingUsers,
     connectToChannel,
+    loadUserChat,
   };
 }

@@ -172,14 +172,18 @@ export function useDeleteJson<TData, TVariables = any>(
 
 // ✅ Internal request helpers
 export async function apiClient<T>(url: string, options: RequestInit = {}): Promise<T> {
+  const method = options.method || "GET";
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
+  const hasBody = options.body !== undefined && options.body !== null;
+  const headers = {
+    ...(options.headers || {}),
+    ...(hasBody && !isFormData ? { "Content-Type": "application/json" } : {}),
+  };
   const res = await fetch(url, {
-    method: options.method || "GET",
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
+    method,
+    headers,
     credentials: "include",
-    body: options.body,
+    body: hasBody ? options.body : undefined,
   });
   const json = await res.json().catch(() => null);
   if (!res.ok) {
